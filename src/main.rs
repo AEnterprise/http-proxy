@@ -22,16 +22,16 @@ use tracing_log::LogTracer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 use twilight_http::{client::Client, request::Request as TwilightRequest, routing::Path};
-use std::time::Instant;
-use std::sync::Arc;
+
+#[cfg(feature = "expose-metrics")]
+use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
 #[cfg(feature = "expose-metrics")]
 use metrics::timing;
 #[cfg(feature = "expose-metrics")]
-use metrics_runtime::{observers::PrometheusBuilder, Receiver};
-#[cfg(feature = "expose-metrics")]
 use metrics_core::{Builder, Drain};
-
+#[cfg(feature = "expose-metrics")]
+use metrics_runtime::{observers::PrometheusBuilder, Receiver};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -55,37 +55,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let address = SocketAddr::from((host, port));
 
-    #[cfg(feature = "metrics")]
-        {
-            let receiver = Receiver::builder()
-                .build()
-                .expect("Failed to create receiver!");
+    #[cfg(feature = "expose-metrics")]
+    {
+        let receiver = Receiver::builder()
+            .build()
+            .expect("Failed to create metrics receiver!");
 
-            receiver.install();
-            let builder = Arc::new(PrometheusBuilder::new());
-        }
+        receiver.install();
+    }
+
+    #[cfg(feature = "expose-metrics")]
+    let metrics_state = Arc::new(PrometheusBuilder::new());
 
     // The closure inside `make_service_fn` is run for each connection,
     // creating a 'service' to handle requests for that specific connection.
     let service = service::make_service_fn(move |addr: &AddrStream| {
         debug!("Connection from: {:?}", addr);
+
         let client = client.clone();
-        #[cfg(feature = "metrics")]
-            let builder = builder.clone();
+
+        #[cfg(feature = "expose-metrics")]
+        let metrics_state = metrics_state.clone();
+
         async move {
             Ok::<_, RequestError>(service::service_fn(move |incoming: Request<Body>| {
                 #[cfg(feature = "expose-metrics")]
-                    {
-                        handle_request(client.clone(), incoming, Some(builder.clone()))
+                {
+                    let uri = incoming.uri();
+
+                    if uri.path() == "/metrics" {
+                        handle_metrics(metrics_state.clone())
+                    } else {
+                        Box::pin(handle_request(client.clone(), incoming))
                     }
+                }
+
                 #[cfg(not(feature = "expose-metrics"))]
-                    {
-                        handle_request(client.clone(), incoming, None)
-                    }
+                {
+                    handle_request(client.clone(), incoming)
+                }
             }))
         }
     });
-
 
     let server = Server::bind(&address).serve(service);
 
@@ -147,14 +158,13 @@ fn path_name(path: &Path) -> &'static str {
         Path::VoiceRegions => "Voice region list",
         Path::WebhooksId(..) => "Webhook",
         Path::OauthApplicationsMe => "Current application info",
-        _ => "Unknown path!"
+        _ => "Unknown path!",
     }
 }
 
-async fn handle_request<T>(
+async fn handle_request(
     client: Client,
     request: Request<Body>,
-    builder: Option<Arc<T>>,
 ) -> Result<Response<Body>, RequestError> {
     debug!("Incoming request: {:?}", request);
 
@@ -171,12 +181,6 @@ async fn handle_request<T>(
     } else {
         uri.path().to_owned()
     };
-
-    #[cfg(feature = "expose-metrics")]
-    if trimmed_path == "/metrics" {
-        // this is only none when the feature flag is off, this could would not exist then
-        return Ok(Response::builder().body(Body::from(builder.unwrap().build().drain())).unwrap());
-    }
 
     let path = match Path::try_from((method.clone(), trimmed_path.as_ref())).context(InvalidPath) {
         Ok(path) => path,
@@ -196,11 +200,7 @@ async fn handle_request<T>(
             return Err(RequestError::NoPath { uri });
         }
     };
-    let body = if bytes.is_empty() {
-        None
-    } else {
-        Some(bytes)
-    };
+    let body = if bytes.is_empty() { None } else { Some(bytes) };
 
     let p = path_name(&path);
     let m = method.to_string();
@@ -213,13 +213,17 @@ async fn handle_request<T>(
         path_str: path_and_query,
     };
 
+    #[cfg(feature = "expose-metrics")]
     let start = Instant::now();
+
     let resp = client.raw(raw_request).await.context(RequestIssue)?;
 
     let status = resp.status();
     let resp_headers = resp.headers().clone();
 
     let bytes = resp.bytes().await.context(ChunkingResponse)?;
+
+    #[cfg(feature = "expose-metrics")]
     let end = Instant::now();
 
     let mut builder = Response::builder().status(status);
@@ -236,7 +240,19 @@ async fn handle_request<T>(
 
     #[cfg(feature = "expose-metrics")]
     timing!("gearbot_proxy_requests", start, end, "method"=>m.to_string(), "route"=>p, "status"=>resp.status().to_string());
+
     info!("{} {}: {}", m, p, resp.status());
 
     Ok(resp)
+}
+
+#[cfg(feature = "expose-metrics")]
+fn handle_metrics(
+    metrics_state: Arc<PrometheusBuilder>,
+) -> Pin<Box<dyn Future<Output = Result<Response<Body>, RequestError>> + Send>> {
+    Box::pin(async move {
+        Ok(Response::builder()
+            .body(Body::from(metrics_state.build().drain()))
+            .unwrap())
+    })
 }
