@@ -23,10 +23,14 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 use twilight_http::{client::Client, request::Request as TwilightRequest, routing::Path};
 use std::time::Instant;
+use std::sync::Arc;
+
+#[cfg(feature = "expose-metrics")]
 use metrics::timing;
-use metrics_runtime::{exporters::HttpExporter, observers::PrometheusBuilder, Receiver};
-
-
+#[cfg(feature = "expose-metrics")]
+use metrics_runtime::{observers::PrometheusBuilder, Receiver};
+#[cfg(feature = "expose-metrics")]
+use metrics_core::{Builder, Drain};
 
 
 #[tokio::main]
@@ -51,28 +55,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let address = SocketAddr::from((host, port));
 
-    let receiver = Receiver::builder()
-        .build()
-        .expect("Failed to create receiver!");
+    #[cfg(feature = "metrics")]
+        {
+            let receiver = Receiver::builder()
+                .build()
+                .expect("Failed to create receiver!");
 
-    let controller = receiver.controller();
-    receiver.install();
-    let exporter = HttpExporter::new(
-        controller,
-        PrometheusBuilder::new(),
-        SocketAddr::from((host, port+1)),
-    );
-
-    tokio::spawn(async move { exporter.async_run().await.unwrap() });
+            receiver.install();
+            let builder = Arc::new(PrometheusBuilder::new());
+        }
 
     // The closure inside `make_service_fn` is run for each connection,
     // creating a 'service' to handle requests for that specific connection.
     let service = service::make_service_fn(move |addr: &AddrStream| {
         debug!("Connection from: {:?}", addr);
         let client = client.clone();
+        #[cfg(feature = "metrics")]
+            let builder = builder.clone();
         async move {
             Ok::<_, RequestError>(service::service_fn(move |incoming: Request<Body>| {
-                handle_request(client.clone(), incoming)
+                #[cfg(feature = "expose-metrics")]
+                    {
+                        handle_request(client.clone(), incoming, Some(builder.clone()))
+                    }
+                #[cfg(not(feature = "expose-metrics"))]
+                    {
+                        handle_request(client.clone(), incoming, None)
+                    }
             }))
         }
     });
@@ -91,60 +100,61 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn path_name(path: &Path) -> &'static str {
     match path {
-        Path::ChannelsId(..)=> "Channel",
-        Path::ChannelsIdInvites(..)=> "Channel invite",
-        Path::ChannelsIdMessages(..)=> "Channel message",
-        Path::ChannelsIdMessagesBulkDelete(..)=> "Bulk delete message",
-        Path::ChannelsIdMessagesId(..)=> "Channel message",
-        Path::ChannelsIdMessagesIdReactions(..)=> "Message reaction",
-        Path::ChannelsIdMessagesIdReactionsUserIdType(..)=> "Message reaction for user",
-        Path::ChannelsIdPermissionsOverwriteId(..)=> "Channel permission override",
-        Path::ChannelsIdPins(..)=> "Channel pins",
-        Path::ChannelsIdPinsMessageId(..)=> "Specific channel pin",
-        Path::ChannelsIdTyping(..)=> "Typing indicator",
-        Path::ChannelsIdWebhooks(..)=> "Webhook",
-        Path::Gateway=> "Gateway",
-        Path::GatewayBot=> "Gateway bot info",
-        Path::Guilds=> "Guilds",
-        Path::GuildsId(..)=> "Guild",
-        Path::GuildsIdBans(..)=> "Guild bans",
-        Path::GuildsIdAuditLogs(..)=> "Guild audit logs",
-        Path::GuildsIdBansUserId(..)=> "Guild ban for user",
-        Path::GuildsIdChannels(..)=> "Guild channel",
-        Path::GuildsIdWidget(..)=> "Guild widget",
-        Path::GuildsIdEmojis(..)=> "Guild emoji",
-        Path::GuildsIdEmojisId(..)=> "Specific guild emoji",
-        Path::GuildsIdIntegrations(..)=> "Guild integrations",
-        Path::GuildsIdIntegrationsId(..)=> "Specific guild integration",
-        Path::GuildsIdIntegrationsIdSync(..)=> "Sync guild integration",
-        Path::GuildsIdInvites(..)=> "Guild invites",
-        Path::GuildsIdMembers(..)=> "Guild members",
-        Path::GuildsIdMembersId(..)=> "Specific guild member",
-        Path::GuildsIdMembersIdRolesId(..)=> "Guild member role",
-        Path::GuildsIdMembersMeNick(..)=> "Modify own nickname",
-        Path::GuildsIdPreview(..)=> "Guild preview",
-        Path::GuildsIdPrune(..)=> "Guild prune",
-        Path::GuildsIdRegions(..)=> "Guild region",
-        Path::GuildsIdRoles(..)=> "Guild roles",
-        Path::GuildsIdRolesId(..)=> "Specific guild role",
-        Path::GuildsIdVanityUrl(..)=> "Guild vanity invite",
-        Path::GuildsIdWebhooks(..)=> "Guild webhooks",
-        Path::InvitesCode=> "Invite info",
-        Path::UsersId=> "User info",
-        Path::UsersIdConnections=> "User connections",
-        Path::UsersIdChannels=> "User channels",
-        Path::UsersIdGuilds=> "User in guild",
-        Path::UsersIdGuildsId=> "Guild from user",
-        Path::VoiceRegions=> "Voice region list",
-        Path::WebhooksId(..)=> "Webhook",
+        Path::ChannelsId(..) => "Channel",
+        Path::ChannelsIdInvites(..) => "Channel invite",
+        Path::ChannelsIdMessages(..) => "Channel message",
+        Path::ChannelsIdMessagesBulkDelete(..) => "Bulk delete message",
+        Path::ChannelsIdMessagesId(..) => "Channel message",
+        Path::ChannelsIdMessagesIdReactions(..) => "Message reaction",
+        Path::ChannelsIdMessagesIdReactionsUserIdType(..) => "Message reaction for user",
+        Path::ChannelsIdPermissionsOverwriteId(..) => "Channel permission override",
+        Path::ChannelsIdPins(..) => "Channel pins",
+        Path::ChannelsIdPinsMessageId(..) => "Specific channel pin",
+        Path::ChannelsIdTyping(..) => "Typing indicator",
+        Path::ChannelsIdWebhooks(..) => "Webhook",
+        Path::Gateway => "Gateway",
+        Path::GatewayBot => "Gateway bot info",
+        Path::Guilds => "Guilds",
+        Path::GuildsId(..) => "Guild",
+        Path::GuildsIdBans(..) => "Guild bans",
+        Path::GuildsIdAuditLogs(..) => "Guild audit logs",
+        Path::GuildsIdBansUserId(..) => "Guild ban for user",
+        Path::GuildsIdChannels(..) => "Guild channel",
+        Path::GuildsIdWidget(..) => "Guild widget",
+        Path::GuildsIdEmojis(..) => "Guild emoji",
+        Path::GuildsIdEmojisId(..) => "Specific guild emoji",
+        Path::GuildsIdIntegrations(..) => "Guild integrations",
+        Path::GuildsIdIntegrationsId(..) => "Specific guild integration",
+        Path::GuildsIdIntegrationsIdSync(..) => "Sync guild integration",
+        Path::GuildsIdInvites(..) => "Guild invites",
+        Path::GuildsIdMembers(..) => "Guild members",
+        Path::GuildsIdMembersId(..) => "Specific guild member",
+        Path::GuildsIdMembersIdRolesId(..) => "Guild member role",
+        Path::GuildsIdMembersMeNick(..) => "Modify own nickname",
+        Path::GuildsIdPreview(..) => "Guild preview",
+        Path::GuildsIdPrune(..) => "Guild prune",
+        Path::GuildsIdRegions(..) => "Guild region",
+        Path::GuildsIdRoles(..) => "Guild roles",
+        Path::GuildsIdRolesId(..) => "Specific guild role",
+        Path::GuildsIdVanityUrl(..) => "Guild vanity invite",
+        Path::GuildsIdWebhooks(..) => "Guild webhooks",
+        Path::InvitesCode => "Invite info",
+        Path::UsersId => "User info",
+        Path::UsersIdConnections => "User connections",
+        Path::UsersIdChannels => "User channels",
+        Path::UsersIdGuilds => "User in guild",
+        Path::UsersIdGuildsId => "Guild from user",
+        Path::VoiceRegions => "Voice region list",
+        Path::WebhooksId(..) => "Webhook",
         Path::OauthApplicationsMe => "Current application info",
         _ => "Unknown path!"
     }
 }
 
-async fn handle_request(
+async fn handle_request<T>(
     client: Client,
     request: Request<Body>,
+    builder: Option<Arc<T>>,
 ) -> Result<Response<Body>, RequestError> {
     debug!("Incoming request: {:?}", request);
 
@@ -161,6 +171,13 @@ async fn handle_request(
     } else {
         uri.path().to_owned()
     };
+
+    #[cfg(feature = "expose-metrics")]
+    if trimmed_path == "/metrics" {
+        // this is only none when the feature flag is off, this could would not exist then
+        return Ok(Response::builder().body(Body::from(builder.unwrap().build().drain())).unwrap());
+    }
+
     let path = match Path::try_from((method.clone(), trimmed_path.as_ref())).context(InvalidPath) {
         Ok(path) => path,
         Err(e) => {
@@ -217,6 +234,7 @@ async fn handle_request(
 
     debug!("Response: {:?}", resp);
 
+    #[cfg(feature = "expose-metrics")]
     timing!("gearbot_proxy_requests", start, end, "method"=>m.to_string(), "route"=>p, "status"=>resp.status().to_string());
     info!("{} {}: {}", m, p, resp.status());
 
